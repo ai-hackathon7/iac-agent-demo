@@ -1,0 +1,119 @@
+/**
+ * OrgVpc — CDK L3 construct implementing org VPC module v2.1.0.
+ *
+ * Mirrors the Terraform module's resource layout:
+ *   • aws_vpc          → ec2.Vpc
+ *   • aws_subnet       → managed by ec2.Vpc (public + private, /20 each)
+ *   • aws_internet_gateway  → managed by ec2.Vpc
+ *   • aws_nat_gateway       → managed by ec2.Vpc (one per AZ, or singleNat)
+ *   • aws_route_table / aws_route → managed by ec2.Vpc
+ *
+ * Naming convention: {env}-{project}-vpc  (org standard for resource_type=vpc)
+ */
+import * as cdk from 'aws-cdk-lib';
+import * as ec2  from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+
+export interface OrgVpcProps {
+  /** VPC CIDR block. Default: 10.0.0.0/16 */
+  cidrBlock?: string;
+  /** Maximum number of Availability Zones to use. Default: 3 */
+  maxAzs?: number;
+  /** Enable NAT Gateways for private subnet egress. Default: true */
+  enableNat?: boolean;
+  /**
+   * Use a single NAT Gateway instead of one-per-AZ.
+   * Recommended for non-prod to reduce cost. Default: false
+   */
+  singleNat?: boolean;
+  /** Environment name (dev | staging | prod). Required. */
+  environment: string;
+  /** Project short name. Required. */
+  project: string;
+}
+
+export class OrgVpc extends Construct {
+  /** The underlying CDK VPC — use for subnet lookups and cross-stack refs. */
+  public readonly vpc: ec2.Vpc;
+
+  constructor(scope: Construct, id: string, props: OrgVpcProps) {
+    super(scope, id);
+
+    const {
+      cidrBlock  = '10.0.0.0/16',
+      maxAzs     = 3,
+      enableNat  = true,
+      singleNat  = false,
+      environment,
+      project,
+    } = props;
+
+    // ── NAT Gateway configuration ─────────────────────────────────────────────
+    // Mirrors Terraform module: enableNat=false → no NAT; singleNat=true → 1 NGW
+    let natGateways: number;
+    if (!enableNat) {
+      natGateways = 0;
+    } else if (singleNat) {
+      natGateways = 1;
+    } else {
+      natGateways = maxAzs; // one per AZ — org default for high availability
+    }
+
+    // ── Subnet CIDR sizing ────────────────────────────────────────────────────
+    // Mirrors Terraform: cidrsubnet(var.cidr_block, 4, index)
+    // /16 + 4 bits = /20 per subnet (~4 094 usable IPs each)
+    const subnetCidrMask = 20;
+
+    // ── VPC (aws_vpc + aws_subnet + IGW + NGW + route tables) ────────────────
+    // Naming convention: {env}-{project}-vpc
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName:     `${environment}-${project}-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr(cidrBlock),
+      maxAzs,
+      natGateways,
+      enableDnsHostnames: true,  // mirrors enable_dns_hostnames = true
+      enableDnsSupport:   true,  // mirrors enable_dns_support   = true
+      subnetConfiguration: [
+        {
+          // Naming: {env}-{project}-public-{az}
+          // CDK appends the AZ suffix automatically (e.g. "-a", "-b", "-c")
+          name:       `${environment}-${project}-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask:   subnetCidrMask,
+          mapPublicIpOnLaunch: false, // security best-practice: no auto-assign
+        },
+        {
+          // Naming: {env}-{project}-private-{az}
+          name:       `${environment}-${project}-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask:   subnetCidrMask,
+        },
+      ],
+    });
+
+    // ── Resource-level Name tags (supplement stack-level tags) ────────────────
+    // CDK propagates stack tags to all resources; these add explicit Name tags
+    // that mirror the Terraform module's per-resource "Name" tag.
+    cdk.Tags.of(this.vpc).add('Name', `${environment}-${project}-vpc`);
+
+    this.vpc.publicSubnets.forEach((subnet, i) => {
+      const az = subnet.availabilityZone.slice(-1); // e.g. "a", "b", "c"
+      cdk.Tags.of(subnet).add('Name',  `${environment}-${project}-public-${az}`);
+      cdk.Tags.of(subnet).add('Tier',  'public');
+      cdk.Tags.of(subnet).add('Index', String(i));
+    });
+
+    this.vpc.privateSubnets.forEach((subnet, i) => {
+      const az = subnet.availabilityZone.slice(-1);
+      cdk.Tags.of(subnet).add('Name',  `${environment}-${project}-private-${az}`);
+      cdk.Tags.of(subnet).add('Tier',  'private');
+      cdk.Tags.of(subnet).add('Index', String(i));
+    });
+
+    // Tag the Internet Gateway (identified via node child search)
+    const igw = this.vpc.node.findChild('IGW');
+    if (igw) {
+      cdk.Tags.of(igw).add('Name', `${environment}-${project}-igw`);
+    }
+  }
+}

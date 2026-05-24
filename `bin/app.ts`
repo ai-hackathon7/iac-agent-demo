@@ -1,0 +1,45 @@
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { VpcStack } from '../lib/vpc-stack';
+
+const app = new cdk.App();
+
+// ── Required context values ──────────────────────────────────────────────────
+// Pass via `cdk deploy --context env=dev --context project=myapp ...`
+// or set defaults below for local development only.
+const env         = app.node.tryGetContext('env')          ?? '<REQUIRED: dev | staging | prod>';
+const project     = app.node.tryGetContext('project')      ?? '<REQUIRED: project-short-name>';
+const team        = app.node.tryGetContext('team')         ?? '<REQUIRED: owning-team>';
+const costCenter  = app.node.tryGetContext('costCenter')   ?? '<REQUIRED: CC-XXXX>';
+
+// ── Optional context values ──────────────────────────────────────────────────
+const singleNat          = app.node.tryGetContext('singleNat')          === 'true';
+const dataClassification = app.node.tryGetContext('dataClassification') ?? 'internal';
+
+// ── Validate required tags before synthesis ──────────────────────────────────
+const VALID_ENVS = ['dev', 'staging', 'prod'];
+if (!VALID_ENVS.includes(env)) {
+  throw new Error(`Invalid 'env' context value: "${env}". Must be one of: ${VALID_ENVS.join(', ')}.`);
+}
+if (!costCenter.match(/^CC-[0-9]{4}$/)) {
+  throw new Error(`Invalid 'costCenter' context value: "${costCenter}". Must match pattern CC-XXXX (e.g. CC-1234).`);
+}
+const VALID_DATA_CLASSIFICATIONS = ['public', 'internal', 'confidential'];
+if (!VALID_DATA_CLASSIFICATIONS.includes(dataClassification)) {
+  throw new Error(`Invalid 'dataClassification' context value: "${dataClassification}". Must be one of: ${VALID_DATA_CLASSIFICATIONS.join(', ')}.`);
+}
+
+new VpcStack(app, `${env}-${project}-vpc-stack`, {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region:  process.env.CDK_DEFAULT_REGION,
+  },
+  // Stack-level props forwarded to the construct
+  environment:        env,
+  project:            project,
+  team:               team,
+  costCenter:         costCenter,
+  singleNat:          singleNat,
+  dataClassification: dataClassification,
+});

@@ -1,0 +1,77 @@
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { OrgVpc, OrgVpcProps } from './constructs/org-vpc';
+
+export interface VpcStackProps extends cdk.StackProps {
+  /** Environment name — must be dev | staging | prod (org tagging policy). */
+  environment: string;
+  /** Project short name used in resource naming, e.g. "payments". */
+  project: string;
+  /** Owning team (required tag). */
+  team: string;
+  /** Cost centre in format CC-XXXX (required tag). */
+  costCenter: string;
+  /** Use a single NAT Gateway to reduce cost (default: false → one per AZ). */
+  singleNat?: boolean;
+  /** Optional DataClassification tag value (default: "internal"). */
+  dataClassification?: string;
+}
+
+export class VpcStack extends cdk.Stack {
+  /** Expose the org VPC construct for cross-stack references if needed. */
+  public readonly orgVpc: OrgVpc;
+
+  constructor(scope: Construct, id: string, props: VpcStackProps) {
+    super(scope, id, props);
+
+    const {
+      environment,
+      project,
+      team,
+      costCenter,
+      singleNat          = false,
+      dataClassification = 'internal',
+    } = props;
+
+    // ── Stack-level tags (propagate to every resource in the stack) ──────────
+    // Required tags — org tagging policy v1.0
+    cdk.Tags.of(this).add('Environment',        environment);
+    cdk.Tags.of(this).add('Project',            project);
+    cdk.Tags.of(this).add('Team',               team);
+    cdk.Tags.of(this).add('CostCenter',         costCenter);
+    cdk.Tags.of(this).add('ManagedBy',          'cdk');          // overrides plan default of "terraform"
+    // Optional tags — org tagging policy v1.0
+    cdk.Tags.of(this).add('DataClassification', dataClassification);
+
+    // ── Org VPC Construct (module vpc v2.1.0) ─────────────────────────────────
+    const vpcProps: OrgVpcProps = {
+      cidrBlock:   '10.0.0.0/16',
+      maxAzs:      3,
+      enableNat:   true,
+      singleNat,
+      environment,
+      project,
+    };
+
+    this.orgVpc = new OrgVpc(this, 'OrgVpc', vpcProps);
+
+    // ── Stack outputs ─────────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'VpcId', {
+      description: 'VPC ID',
+      value:       this.orgVpc.vpc.vpcId,
+      exportName:  `${environment}-${project}-vpc-id`,
+    });
+
+    new cdk.CfnOutput(this, 'PublicSubnetIds', {
+      description: 'Comma-separated list of public subnet IDs',
+      value:       cdk.Fn.join(',', this.orgVpc.vpc.publicSubnets.map(s => s.subnetId)),
+      exportName:  `${environment}-${project}-public-subnet-ids`,
+    });
+
+    new cdk.CfnOutput(this, 'PrivateSubnetIds', {
+      description: 'Comma-separated list of private subnet IDs',
+      value:       cdk.Fn.join(',', this.orgVpc.vpc.privateSubnets.map(s => s.subnetId)),
+      exportName:  `${environment}-${project}-private-subnet-ids`,
+    });
+  }
+}
