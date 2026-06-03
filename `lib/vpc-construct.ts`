@@ -1,0 +1,119 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+
+// ─────────────────────────────────────────────
+// Props for the reusable VpcConstruct (org vpc module v2.1.0)
+// ─────────────────────────────────────────────
+export interface VpcConstructProps {
+  // REQUIRED inputs — must be provided by the caller
+  environment: 'dev' | 'staging' | 'prod';
+  project: string;         // short name, e.g. "myapp"
+  team: string;            // owning team tag
+  costCenter: string;      // must match CC-XXXX
+
+  // Optional inputs with org-standard defaults
+  cidrBlock?: string;      // default: 10.0.0.0/16
+  maxAzs?: number;         // default: 3
+  enableNat?: boolean;     // default: true
+  singleNat?: boolean;     // default: false  (one NAT per AZ for HA)
+
+  // Optional tags
+  dataClassification?: 'public' | 'internal' | 'confidential';
+  backup?: 'daily' | 'weekly' | 'none';
+}
+
+// ─────────────────────────────────────────────
+// Outputs exposed for downstream stacks
+// ─────────────────────────────────────────────
+export interface VpcConstructOutputs {
+  readonly vpc: ec2.Vpc;
+  readonly publicSubnets: ec2.ISubnet[];
+  readonly privateSubnets: ec2.ISubnet[];
+}
+
+// ─────────────────────────────────────────────
+// Org VPC Construct  (mirrors vpc module v2.1.0)
+// Provisions: VPC · public subnets · private subnets
+//             · Internet Gateway · NAT Gateways (per-AZ or single)
+// ─────────────────────────────────────────────
+export class VpcConstruct extends Construct implements VpcConstructOutputs {
+  public readonly vpc: ec2.Vpc;
+  public readonly publicSubnets: ec2.ISubnet[];
+  public readonly privateSubnets: ec2.ISubnet[];
+
+  constructor(scope: Construct, id: string, props: VpcConstructProps) {
+    super(scope, id);
+
+    // ── Resolved config (org defaults applied) ──────────────────────────
+    const cidrBlock  = props.cidrBlock  ?? '10.0.0.0/16';
+    const maxAzs     = props.maxAzs     ?? 3;
+    const enableNat  = props.enableNat  ?? true;
+    const singleNat  = props.singleNat  ?? false;
+
+    const env     = props.environment;
+    const project = props.project;
+
+    // ── Org naming convention: {env}-{project}-vpc ───────────────────────
+    const vpcName = `${env}-${project}-vpc`;
+
+    // ── NAT Gateway mode ─────────────────────────────────────────────────
+    //   singleNat=false → one NAT per AZ (HA, production-grade)
+    //   singleNat=true  → one NAT total  (cost-saving for non-prod)
+    const natGateways = !enableNat
+      ? 0
+      : singleNat
+        ? 1
+        : maxAzs; // one per AZ
+
+    // ── VPC + subnets ─────────────────────────────────────────────────────
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName,
+      ipAddresses: ec2.IpAddresses.cidr(cidrBlock),
+      maxAzs,
+      natGateways,
+      enableDnsHostnames: true,
+      enableDnsSupport:   true,
+      // Org naming convention for subnets: {env}-{project}-subnet-{tier}-{az}
+      subnetConfiguration: [
+        {
+          cidrMask:   20,  // /20 per subnet — yields 4096 IPs, 6 subnets from /16
+          name:       `${env}-${project}-subnet-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+          mapPublicIpOnLaunch: false,
+        },
+        {
+          cidrMask:   20,
+          name:       `${env}-${project}-subnet-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        },
+      ],
+    });
+
+    // ── Expose subnet lists (module outputs) ──────────────────────────────
+    this.publicSubnets  = this.vpc.publicSubnets;
+    this.privateSubnets = this.vpc.privateSubnets;
+
+    // ── Required tags (org tagging policy v1.0) applied to every resource ─
+    // Applying at the construct level cascades to VPC, subnets, IGW, NATs,
+    // route tables, and EIPs created by ec2.Vpc.
+    const requiredTags: Record<string, string> = {
+      Environment: env,
+      Project:     project,
+      Team:        props.team,
+      CostCenter:  props.costCenter,
+      ManagedBy:   'cdk',
+    };
+    for (const [key, value] of Object.entries(requiredTags)) {
+      cdk.Tags.of(this).add(key, value);
+    }
+
+    // ── Optional tags ──────────────────────────────────────────────────────
+    if (props.dataClassification) {
+      cdk.Tags.of(this).add('DataClassification', props.dataClassification);
+    }
+    if (props.backup) {
+      cdk.Tags.of(this).add('Backup', props.backup);
+    }
+  }
+}

@@ -1,0 +1,61 @@
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { VpcConstruct } from './vpc-construct';
+
+// ─────────────────────────────────────────────
+// Stack props — all REQUIRED fields are surfaced
+// here so callers cannot forget them.
+// ─────────────────────────────────────────────
+export interface InfraStackProps extends cdk.StackProps {
+  // ⚠️  REQUIRED — replace placeholder values before deployment
+  environment: 'dev' | 'staging' | 'prod';
+  project:     string;   // e.g. "myapp"
+  team:        string;   // e.g. "platform"
+  costCenter:  string;   // e.g. "CC-1234"
+
+  // Optional overrides (org defaults applied when omitted)
+  cidrBlock?:  string;   // default: "10.0.0.0/16"
+  maxAzs?:     number;   // default: 3
+  enableNat?:  boolean;  // default: true
+  singleNat?:  boolean;  // default: false
+}
+
+export class InfraStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: InfraStackProps) {
+    super(scope, id, props);
+
+    // ── VPC (org vpc module v2.1.0) ───────────────────────────────────────
+    // Provisions: VPC, 3 public subnets, 3 private subnets,
+    //             1 Internet Gateway, 3 NAT Gateways (one per AZ)
+    const vpcConstruct = new VpcConstruct(this, 'VpcConstruct', {
+      environment: props.environment,
+      project:     props.project,
+      team:        props.team,
+      costCenter:  props.costCenter,
+
+      cidrBlock:  props.cidrBlock,
+      maxAzs:     props.maxAzs,
+      enableNat:  props.enableNat,
+      singleNat:  props.singleNat,
+    });
+
+    // ── Stack-level outputs ────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'VpcId', {
+      value:       vpcConstruct.vpc.vpcId,
+      description: 'VPC ID',
+      exportName:  `${props.environment}-${props.project}-vpc-id`,
+    });
+
+    new cdk.CfnOutput(this, 'PublicSubnetIds', {
+      value:       vpcConstruct.publicSubnets.map(s => s.subnetId).join(','),
+      description: 'Public subnet IDs (comma-separated)',
+      exportName:  `${props.environment}-${props.project}-public-subnet-ids`,
+    });
+
+    new cdk.CfnOutput(this, 'PrivateSubnetIds', {
+      value:       vpcConstruct.privateSubnets.map(s => s.subnetId).join(','),
+      description: 'Private subnet IDs (comma-separated)',
+      exportName:  `${props.environment}-${props.project}-private-subnet-ids`,
+    });
+  }
+}
