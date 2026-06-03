@@ -1,0 +1,103 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+import { VpcConstruct } from './vpc-construct';
+import { EcsServiceConstruct } from './ecs-service-construct';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  REQUIRED VALUES — fill these in before running `cdk deploy`
+// ─────────────────────────────────────────────────────────────────────────────
+const REQUIRED = {
+  TEAM:              '<REQUIRED: owning team name, e.g. "platform-eng">',
+  COST_CENTER:       '<REQUIRED: cost center, format CC-XXXX, e.g. "CC-0001">',
+  SSH_TRUSTED_CIDR:  '<REQUIRED: restrict SSH SG to a trusted CIDR, e.g. "203.0.113.10/32">',
+  CONTAINER_IMAGE:   '<REQUIRED: container image URI, e.g. "123456789012.dkr.ecr.us-east-1.amazonaws.com/myproject-bastion:latest">',
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class DevMyprojectStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // ── Stack-level tags (applied to every resource) ─────────────────────────
+    // Required tags per org tagging policy v1.0
+    cdk.Tags.of(this).add('Environment', 'dev');
+    cdk.Tags.of(this).add('Project',     'myproject');
+    cdk.Tags.of(this).add('Team',        REQUIRED.TEAM);
+    cdk.Tags.of(this).add('CostCenter',  REQUIRED.COST_CENTER);
+    cdk.Tags.of(this).add('ManagedBy',   'cdk'); // corrected from plan: was "terraform"
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. VPC  (org module: vpc @ v2.1.0)
+    //    Name: dev-myproject-vpc
+    // ─────────────────────────────────────────────────────────────────────────
+    const vpcConstruct = new VpcConstruct(this, 'DevMyprojectVpc', {
+      cidrBlock:   '10.0.0.0/16',
+      maxAzs:      2,
+      enableNat:   true,
+      singleNat:   true,   // cost-saving for dev; set false in staging/prod
+      environment: 'dev',
+      project:     'myproject',
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. SSH Security Group
+    //    Name (org convention): dev-myproject-ssh-sg
+    //    ⚠️  SSH_TRUSTED_CIDR must be set to a specific IP/range before deploy
+    // ─────────────────────────────────────────────────────────────────────────
+    const sshSecurityGroup = new ec2.SecurityGroup(this, 'SshSecurityGroup', {
+      securityGroupName: 'dev-myproject-ssh-sg',
+      vpc:               vpcConstruct.vpc,
+      description:       'Allow inbound SSH (port 22) from a trusted CIDR only',
+      allowAllOutbound:  false, // explicit egress defined below
+    });
+
+    // Ingress: SSH from trusted CIDR only — NEVER 0.0.0.0/0
+    sshSecurityGroup.addIngressRule(
+      ec2.Peer.ipv4(REQUIRED.SSH_TRUSTED_CIDR),
+      ec2.Port.tcp(22),
+      'SSH from trusted corporate CIDR only',
+    );
+
+    // Egress: allow all outbound (mirrors original plan's egress rule)
+    sshSecurityGroup.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.allTraffic(),
+      'Allow all outbound',
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. ECS Fargate Service  (org module: ecs-service @ v1.3.0)
+    //    Replaces the BLOCKED aws_instance component per org policy.
+    //    Name: dev-myproject-bastion
+    //    ➜ Runs in PRIVATE subnets; reached via ALB or SSM Session Manager.
+    //    ➜ SSH SG attached to tasks so the SSH-on-port-22 flow is preserved
+    //      if your image requires it, but SSM exec is the preferred method.
+    // ─────────────────────────────────────────────────────────────────────────
+    new EcsServiceConstruct(this, 'DevMyprojectBastion', {
+      serviceName:     'dev-myproject-bastion',
+      containerImage:  REQUIRED.CONTAINER_IMAGE,
+      containerPort:   22,
+      cpu:             256,
+      memoryLimitMiB:  512,
+      desiredCount:    1,
+      minCapacity:     1,
+      maxCapacity:     1,
+      vpc:             vpcConstruct.vpc,
+      taskSecurityGroups: [sshSecurityGroup], // attach trusted-CIDR SSH SG to tasks
+      environment:     'dev',
+      project:         'myproject',
+      healthCheckPath: '/health', // ⚠️  update if your container exposes a different path
+    });
+
+    // ── Stack Outputs ─────────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'VpcId', {
+      description: 'VPC ID',
+      value: vpcConstruct.vpc.vpcId,
+    });
+    new cdk.CfnOutput(this, 'SshSecurityGroupId', {
+      description: 'SSH Security Group ID',
+      value: sshSecurityGroup.securityGroupId,
+    });
+  }
+}
