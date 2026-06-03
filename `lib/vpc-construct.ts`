@@ -1,0 +1,71 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import { Construct } from 'constructs';
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Org VPC Module  (vpc @ v2.1.0)
+// Naming convention: {env}-{project}-vpc
+// ──────────────────────────────────────────────────────────────────────────────
+export interface VpcConstructProps {
+  cidrBlock: string;
+  maxAzs: number;
+  enableNat: boolean;
+  /** Use a single shared NAT GW instead of one-per-AZ (cost saving for dev) */
+  singleNat: boolean;
+  environment: string;
+  project: string;
+}
+
+export class VpcConstruct extends Construct {
+  public readonly vpc: ec2.Vpc;
+  public readonly publicSubnets: ec2.ISubnet[];
+  public readonly privateSubnets: ec2.ISubnet[];
+
+  constructor(scope: Construct, id: string, props: VpcConstructProps) {
+    super(scope, id);
+
+    const natGatewayCount = !props.enableNat
+      ? 0
+      : props.singleNat
+      ? 1
+      : props.maxAzs;
+
+    // ── VPC ──────────────────────────────────────────────────────────────────
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName: `${props.environment}-${props.project}-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr(props.cidrBlock),
+      maxAzs: props.maxAzs,
+      natGateways: natGatewayCount,
+      enableDnsHostnames: true,
+      enableDnsSupport: true,
+      subnetConfiguration: [
+        {
+          cidrMask: 24,
+          name: `${props.environment}-${props.project}-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+        },
+        {
+          cidrMask: 24,
+          name: `${props.environment}-${props.project}-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        },
+      ],
+    });
+
+    // ── VPC Flow Logs (REQUIRED by org policy) ────────────────────────────────
+    const flowLogGroup = new logs.LogGroup(this, 'VpcFlowLogGroup', {
+      logGroupName: `/aws/vpc/flowlogs/${props.environment}-${props.project}-vpc`,
+      retention: logs.RetentionDays.THREE_MONTHS,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    this.vpc.addFlowLog('FlowLog', {
+      destination: ec2.FlowLogDestination.toCloudWatchLogs(flowLogGroup),
+      trafficType: ec2.FlowLogTrafficType.ALL,
+    });
+
+    this.publicSubnets  = this.vpc.publicSubnets;
+    this.privateSubnets = this.vpc.privateSubnets;
+  }
+}

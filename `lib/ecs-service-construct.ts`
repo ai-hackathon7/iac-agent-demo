@@ -1,0 +1,201 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as appscaling from 'aws-cdk-lib/aws-applicationautoscaling';
+import { Construct } from 'constructs';
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Org ECS-Service Module  (ecs-service @ v1.3.0)
+// Naming convention: {env}-{project}-cluster / {env}-{project}-{service}-role
+// ──────────────────────────────────────────────────────────────────────────────
+export interface EcsServiceConstructProps {
+  serviceName: string;
+  containerImage: string;
+  containerPort: number;
+  cpu: number;
+  memoryLimitMiB: number;
+  desiredCount: number;
+  minCapacity: number;
+  maxCapacity: number;
+  vpc: ec2.IVpc;
+  /** Security group(s) to attach to the Fargate tasks */
+  taskSecurityGroups?: ec2.ISecurityGroup[];
+  environment: string;
+  project: string;
+  healthCheckPath?: string;
+}
+
+export class EcsServiceConstruct extends Construct {
+  public readonly service: ecs.FargateService;
+  public readonly loadBalancer: elbv2.ApplicationLoadBalancer;
+  public readonly listener: elbv2.ApplicationListener;
+
+  constructor(scope: Construct, id: string, props: EcsServiceConstructProps) {
+    super(scope, id);
+
+    const healthCheckPath = props.healthCheckPath ?? '/health';
+
+    // ── ECS Cluster ───────────────────────────────────────────────────────────
+    const cluster = new ecs.Cluster(this, 'Cluster', {
+      clusterName: `${props.environment}-${props.project}-cluster`,
+      vpc: props.vpc,
+      containerInsights: true,
+    });
+
+    // ── CloudWatch Log Group ──────────────────────────────────────────────────
+    const logGroup = new logs.LogGroup(this, 'ServiceLogGroup', {
+      logGroupName: `/ecs/${props.environment}-${props.project}/${props.serviceName}`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // ── Task Execution Role ───────────────────────────────────────────────────
+    // Naming: {env}-{project}-{service}-role
+    const executionRole = new iam.Role(this, 'TaskExecutionRole', {
+      roleName: `${props.environment}-${props.project}-${props.serviceName}-exec-role`,
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: `ECS task execution role for ${props.serviceName}`,
+    });
+    // Scoped permissions — no wildcards
+    executionRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'EcrImagePull',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'ecr:GetAuthorizationToken',
+        'ecr:BatchCheckLayerAvailability',
+        'ecr:GetDownloadUrlForLayer',
+        'ecr:BatchGetImage',
+      ],
+      // ECR GetAuthorizationToken requires '*' at the resource level (AWS limitation)
+      resources: ['*'],
+    }));
+    executionRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'CloudWatchLogging',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'logs:CreateLogStream',
+        'logs:PutLogEvents',
+      ],
+      resources: [logGroup.logGroupArn],
+    }));
+
+    // ── Task Role (runtime permissions for the container) ─────────────────────
+    const taskRole = new iam.Role(this, 'TaskRole', {
+      roleName: `${props.environment}-${props.project}-${props.serviceName}-task-role`,
+      assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+      description: `ECS task runtime role for ${props.serviceName}`,
+    });
+    // Add SSM Session Manager permissions — enables shell access without open SSH ports
+    taskRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'SsmSessionManager',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'ssmmessages:CreateControlChannel',
+        'ssmmessages:CreateDataChannel',
+        'ssmmessages:OpenControlChannel',
+        'ssmmessages:OpenDataChannel',
+      ],
+      resources: ['*'], // SSM Messages API requires '*' resource (AWS limitation)
+    }));
+
+    // ── Task Definition ───────────────────────────────────────────────────────
+    const taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDef', {
+      family: `${props.environment}-${props.project}-${props.serviceName}`,
+      cpu: props.cpu,
+      memoryLimitMiB: props.memoryLimitMiB,
+      executionRole,
+      taskRole,
+    });
+
+    taskDefinition.addContainer('AppContainer', {
+      containerName: props.serviceName,
+      image: ecs.ContainerImage.fromRegistry(props.containerImage),
+      portMappings: [{ containerPort: props.containerPort }],
+      logging: ecs.LogDriver.awsLogs({
+        logGroup,
+        streamPrefix: props.serviceName,
+      }),
+      readonlyRootFilesystem: true,
+    });
+
+    // ── ALB Security Group (public-facing) ────────────────────────────────────
+    // Naming: {env}-{project}-alb-sg
+    const albSg = new ec2.SecurityGroup(this, 'AlbSecurityGroup', {
+      securityGroupName: `${props.environment}-${props.project}-alb-sg`,
+      vpc: props.vpc,
+      description: `ALB SG for ${props.serviceName}`,
+      allowAllOutbound: false,
+    });
+    albSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(props.containerPort),
+      `Allow inbound on container port ${props.containerPort}`,
+    );
+    albSg.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.allTraffic(),
+      'Allow all outbound from ALB',
+    );
+
+    // ── Application Load Balancer (public subnet) ─────────────────────────────
+    this.loadBalancer = new elbv2.ApplicationLoadBalancer(this, 'Alb', {
+      loadBalancerName: `${props.environment}-${props.project}-alb`,
+      vpc: props.vpc,
+      internetFacing: true,
+      securityGroup: albSg,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      deletionProtection: false, // set true for prod
+    });
+
+    this.listener = this.loadBalancer.addListener('Listener', {
+      port: props.containerPort,
+      open: true,
+    });
+
+    // ── Fargate Service (private subnet) ──────────────────────────────────────
+    this.service = new ecs.FargateService(this, 'FargateService', {
+      serviceName: props.serviceName,
+      cluster,
+      taskDefinition,
+      desiredCount: props.desiredCount,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }, // workload stays private
+      securityGroups: props.taskSecurityGroups ?? [],
+      assignPublicIp: false,
+      enableExecuteCommand: true, // allows SSM exec (alternative to SSH)
+      circuitBreaker: { rollback: true },
+    });
+
+    this.listener.addTargets('EcsTarget', {
+      port: props.containerPort,
+      targets: [this.service],
+      healthCheck: {
+        path: healthCheckPath,
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(5),
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 3,
+      },
+      deregistrationDelay: cdk.Duration.seconds(30),
+    });
+
+    // ── Auto-Scaling ──────────────────────────────────────────────────────────
+    const scaling = this.service.autoScaleTaskCount({
+      minCapacity: props.minCapacity,
+      maxCapacity: props.maxCapacity,
+    });
+    scaling.scaleOnCpuUtilization('CpuScaling', {
+      targetUtilizationPercent: 70,
+      scaleInCooldown: cdk.Duration.seconds(60),
+      scaleOutCooldown: cdk.Duration.seconds(60),
+    });
+
+    // ── Outputs ───────────────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'LoadBalancerDnsName', {
+      description: 'ALB DNS Name',
+      value: this.loadBalancer.loadBalancerDnsName,
+    });
+  }
+}
