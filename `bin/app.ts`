@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { BastionInfraStack } from '../lib/stack';
+
+const app = new cdk.App();
+
+// ---------------------------------------------------------------------------
+// Runtime context — supply via `cdk deploy --context env=dev` etc., or edit
+// the defaults below before deploying.
+// ---------------------------------------------------------------------------
+const env     = app.node.tryGetContext('env')        ?? 'dev';        // REQUIRED: dev | staging | prod
+const project = app.node.tryGetContext('project')    ?? 'myproject';  // REQUIRED: short project name
+const team    = app.node.tryGetContext('team')        ?? 'platform';   // REQUIRED: owning team
+const cost    = app.node.tryGetContext('costCenter')  ?? 'CC-0000';    // REQUIRED: must match CC-XXXX
+
+new BastionInfraStack(app, `${env}-${project}-stack`, {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region:  process.env.CDK_DEFAULT_REGION,
+  },
+  stackEnv:    env,
+  stackProject: project,
+  stackTeam:   team,
+  costCenter:  cost,
+});

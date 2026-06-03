@@ -1,0 +1,105 @@
+// ============================================================================
+// Org VPC Module  — vpc v2.1.0
+// Mirrors module inputs: cidrBlock, maxAzs, enableNat, singleNat,
+//                        environment, project
+// Outputs: vpc, publicSubnets, privateSubnets
+// ============================================================================
+import * as cdk  from 'aws-cdk-lib';
+import * as ec2  from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+
+export interface VpcConstructProps {
+  /** VPC CIDR block. Default: 10.0.0.0/16 */
+  cidrBlock?:   string;
+  /** Maximum number of AZs to span. Default: 3 */
+  maxAzs?:      number;
+  /** Enable NAT gateways. Default: true */
+  enableNat?:   boolean;
+  /** Use a single shared NAT gateway (cost-saving for non-prod). Default: false */
+  singleNat?:   boolean;
+  /** Environment name — required */
+  environment:  string;
+  /** Project short name — required */
+  project:      string;
+}
+
+export class VpcConstruct extends Construct {
+  /** The created VPC */
+  public readonly vpc: ec2.Vpc;
+  /** Public subnets across all AZs */
+  public readonly publicSubnets: ec2.ISubnet[];
+  /** Private subnets across all AZs */
+  public readonly privateSubnets: ec2.ISubnet[];
+
+  constructor(scope: Construct, id: string, props: VpcConstructProps) {
+    super(scope, id);
+
+    const cidrBlock = props.cidrBlock  ?? '10.0.0.0/16';
+    const maxAzs    = props.maxAzs     ?? 3;
+    const enableNat = props.enableNat  ?? true;
+    const singleNat = props.singleNat  ?? false;
+
+    // ------------------------------------------------------------------
+    // Determine NAT gateway configuration
+    // ------------------------------------------------------------------
+    let natGateways: number | undefined;
+    if (!enableNat) {
+      natGateways = 0;
+    } else if (singleNat) {
+      natGateways = 1;           // one shared NAT — cost-saving for non-prod
+    } else {
+      natGateways = maxAzs;      // one NAT per AZ — HA default
+    }
+
+    // ------------------------------------------------------------------
+    // VPC — naming convention: {env}-{project}-vpc
+    // ------------------------------------------------------------------
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName:     `${props.environment}-${props.project}-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr(cidrBlock),
+      maxAzs,
+      natGateways,
+      enableDnsHostnames: true,
+      enableDnsSupport:   true,
+      subnetConfiguration: [
+        {
+          // naming convention: {env}-{project}-public-{az}
+          name:       `${props.environment}-${props.project}-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask:   20,   // /20 per AZ — 4,094 hosts each
+        },
+        {
+          // naming convention: {env}-{project}-private-{az}
+          name:       `${props.environment}-${props.project}-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask:   20,
+        },
+      ],
+    });
+
+    // Expose subnet lists (convenience accessors matching module outputs)
+    this.publicSubnets  = this.vpc.publicSubnets;
+    this.privateSubnets = this.vpc.privateSubnets;
+
+    // ------------------------------------------------------------------
+    // CloudFormation outputs (mirrors module outputs)
+    // ------------------------------------------------------------------
+    new cdk.CfnOutput(this, 'VpcId', {
+      value:       this.vpc.vpcId,
+      description: 'VPC ID',
+      exportName:  `${props.environment}-${props.project}-vpc-id`,
+    });
+
+    new cdk.CfnOutput(this, 'PublicSubnetIds', {
+      value:       cdk.Fn.join(',', this.publicSubnets.map(s => s.subnetId)),
+      description: 'Public subnet IDs',
+      exportName:  `${props.environment}-${props.project}-public-subnet-ids`,
+    });
+
+    new cdk.CfnOutput(this, 'PrivateSubnetIds', {
+      value:       cdk.Fn.join(',', this.privateSubnets.map(s => s.subnetId)),
+      description: 'Private subnet IDs',
+      exportName:  `${props.environment}-${props.project}-private-subnet-ids`,
+    });
+  }
+}
