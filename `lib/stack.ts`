@@ -1,0 +1,97 @@
+import * as cdk  from 'aws-cdk-lib';
+import * as ec2  from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+import { VpcConstruct } from './vpc-construct';
+
+// ---------------------------------------------------------------------------
+// Stack props
+// ---------------------------------------------------------------------------
+export interface BastionInfraStackProps extends cdk.StackProps {
+  /** Deployment environment: dev | staging | prod */
+  stackEnv:     string;
+  /** Short project identifier */
+  stackProject: string;
+  /** Owning team */
+  stackTeam:    string;
+  /** Cost-center tag value — must match CC-XXXX */
+  costCenter:   string;
+}
+
+// ---------------------------------------------------------------------------
+// Stack
+// ---------------------------------------------------------------------------
+export class BastionInfraStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: BastionInfraStackProps) {
+    super(scope, id, props);
+
+    const { stackEnv: env, stackProject: project, stackTeam: team, costCenter } = props;
+
+    // ======================================================================
+    // REQUIRED TAGS  (org tagging policy v1.0)
+    // Applied at stack level — inherited by every resource in the stack.
+    // ======================================================================
+    cdk.Tags.of(this).add('Environment', env);        // allowed: dev | staging | prod
+    cdk.Tags.of(this).add('Project',     project);
+    cdk.Tags.of(this).add('Team',        team);
+    cdk.Tags.of(this).add('CostCenter',  costCenter); // pattern: ^CC-[0-9]{4}$
+    cdk.Tags.of(this).add('ManagedBy',   'cdk');
+
+    // ======================================================================
+    // 1. VPC  — org module: vpc v2.1.0
+    //    Naming convention: {env}-{project}-vpc
+    // ======================================================================
+    const vpcConstruct = new VpcConstruct(this, 'VpcConstruct', {
+      cidrBlock:   '10.0.0.0/16',
+      maxAzs:      3,
+      enableNat:   true,
+      singleNat:   false,      // one NAT per AZ (HA); set true to reduce cost in dev
+      environment: env,
+      project:     project,
+    });
+
+    // ======================================================================
+    // 2. Bastion Security Group
+    //    Naming convention: {env}-{project}-{service}-sg  →  bastion-sg
+    //
+    //    ⚠️  SECURITY WARNING: SSH ingress is open to 0.0.0.0/0 and ::/0
+    //    as specified in the plan.  Strongly recommended to restrict the
+    //    source CIDR to known office/VPN IP ranges before production use.
+    // ======================================================================
+    const bastionSg = new ec2.SecurityGroup(this, 'BastionSg', {
+      // org naming convention: {env}-{project}-bastion-sg
+      securityGroupName: `${env}-${project}-bastion-sg`,
+      description:       'Security group for bastion host - allows inbound SSH from anywhere',
+      vpc:               vpcConstruct.vpc,
+      // Default egress rule (allow all outbound) is added automatically by CDK;
+      // allowAllOutbound mirrors the plan's egress_rules entry.
+      allowAllOutbound:  true,
+    });
+
+    // ------------------------------------------------------------------
+    // Ingress: SSH (TCP/22) from anywhere — IPv4
+    // ------------------------------------------------------------------
+    bastionSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(22),
+      'SSH access from anywhere (IPv4) — ⚠️ restrict in production',
+    );
+
+    // ------------------------------------------------------------------
+    // Ingress: SSH (TCP/22) from anywhere — IPv6
+    // ------------------------------------------------------------------
+    bastionSg.addIngressRule(
+      ec2.Peer.anyIpv6(),
+      ec2.Port.tcp(22),
+      'SSH access from anywhere (IPv6) — ⚠️ restrict in production',
+    );
+
+    // ------------------------------------------------------------------
+    // CloudFormation output
+    // ------------------------------------------------------------------
+    new cdk.CfnOutput(this, 'BastionSgId', {
+      value:       bastionSg.securityGroupId,
+      description: 'Bastion host security group ID',
+      exportName:  `${env}-${project}-bastion-sg-id`,
+    });
+  }
+}
