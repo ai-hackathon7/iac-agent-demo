@@ -1,0 +1,178 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import { Construct } from 'constructs';
+import { OrgVpc } from './constructs/org-vpc';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stack Props
+// ─────────────────────────────────────────────────────────────────────────────
+export interface BastionStackProps extends cdk.StackProps {
+  /** Deployment environment: dev | staging | prod */
+  readonly envName:    string;
+  /** Short project identifier */
+  readonly project:    string;
+  /** Owning team (required tag) */
+  readonly team:       string;
+  /** Cost center matching CC-[0-9]{4} (required tag) */
+  readonly costCenter: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BastionStack
+//
+// Resources:
+//   1. VPC (org module v2.1.0) – 10.0.0.0/16, 2 AZs, single NAT
+//   2. Security Group           – SSH inbound on port 22
+//   3. IAM Role + Profile       – SSM + CloudWatch permissions for EC2
+//   4. EC2 Instance             – Amazon Linux 2023, t3.micro, public subnet
+//   5. CloudWatch Log Group     – 30-day retention for EC2 logs
+// ─────────────────────────────────────────────────────────────────────────────
+export class BastionStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: BastionStackProps) {
+    super(scope, id, props);
+
+    const { envName, project, team, costCenter } = props;
+
+    // ── Shared tag helper ─────────────────────────────────────────────────
+    // Applied at stack level so every resource inherits them automatically.
+    const requiredTags: Record<string, string> = {
+      Environment: envName,
+      Project:     project,
+      Team:        team,
+      CostCenter:  costCenter,
+      ManagedBy:   'cdk',
+    };
+    Object.entries(requiredTags).forEach(([k, v]) => cdk.Tags.of(this).add(k, v));
+
+
+    // ── 1. VPC (Org Module v2.1.0) ────────────────────────────────────────
+    // Naming: {env}-{project}-vpc
+    // Subnets: {env}-{project}-public-{az} / {env}-{project}-private-{az}
+    const orgVpc = new OrgVpc(this, 'OrgVpc', {
+      cidrBlock:   '10.0.0.0/16',
+      maxAzs:      2,          // 2 AZs — adequate for single-instance, minimises cost
+      enableNat:   true,
+      singleNat:   true,       // One shared NAT gateway — see ASSUMPTIONS
+      environment: envName,
+      project:     project,
+    });
+
+    const vpc = orgVpc.vpc;
+
+
+    // ── 2. Security Group ─────────────────────────────────────────────────
+    // Naming convention: {env}-{project}-{service}-sg → {env}-{project}-ssh-sg
+    // ⚠ SSH is open to 0.0.0.0/0 — restrict in staging/prod (see ASSUMPTIONS)
+    const sshSg = new ec2.SecurityGroup(this, 'SshSecurityGroup', {
+      securityGroupName: `${envName}-${project}-ssh-sg`,
+      description:       'Allow inbound SSH access to EC2 bastion instance',
+      vpc,
+      allowAllOutbound:  true,  // Covers the all-traffic egress rule in the plan
+    });
+
+    sshSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(22),
+      'SSH access — RESTRICT TO KNOWN CIDR IN PRODUCTION',
+    );
+
+
+    // ── 3. IAM Role + Instance Profile ───────────────────────────────────
+    // Naming convention: {env}-{project}-{service}-role → {env}-{project}-ec2-role
+    const ec2Role = new iam.Role(this, 'Ec2IamRole', {
+      roleName:    `${envName}-${project}-ec2-role`,
+      description: 'IAM role for EC2 bastion with SSM and CloudWatch permissions',
+      assumedBy:   new iam.ServicePrincipal('ec2.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'),
+      ],
+    });
+
+    // CDK creates the instance profile automatically when you pass the role
+    // to the Instance construct. An explicit CfnInstanceProfile is created
+    // here so the profile name matches the org convention.
+    const instanceProfile = new iam.CfnInstanceProfile(this, 'Ec2InstanceProfile', {
+      instanceProfileName: `${envName}-${project}-ec2-role`,
+      roles: [ec2Role.roleName],
+    });
+    instanceProfile.addDependency(ec2Role.node.defaultChild as cdk.CfnResource);
+
+
+    // ── 4. EC2 Instance ───────────────────────────────────────────────────
+    // Naming convention (Name tag): {env}-{project}-bastion
+    // AMI: latest Amazon Linux 2023 resolved at synth time for the target region
+    // Key pair: {project}-keypair — must pre-exist in the target account/region
+    const ami = ec2.MachineImage.latestAmazonLinux2023({
+      cpuType: ec2.AmazonLinuxCpuType.X86_64,
+    });
+
+    // Place the bastion in the first public subnet (index 0)
+    const bastionSubnet = orgVpc.publicSubnets[0];
+
+    const bastion = new ec2.Instance(this, 'BastionInstance', {
+      instanceName:              `${envName}-${project}-bastion`,
+      vpc,
+      instanceType:              new ec2.InstanceType('t3.micro'),
+      machineImage:              ami,
+      securityGroup:             sshSg,
+      vpcSubnets:                { subnets: [bastionSubnet] },
+      associatePublicIpAddress:  true,
+      role:                      ec2Role,
+      keyName:                   `${project}-keypair`,
+      blockDevices: [
+        {
+          deviceName: '/dev/xvda',               // Root volume for Amazon Linux 2023
+          volume: ec2.BlockDeviceVolume.ebs(20, {
+            volumeType:  ec2.EbsDeviceVolumeType.GP3,
+            encrypted:   true,
+            deleteOnTermination: true,
+          }),
+        },
+      ],
+      // Metadata options — enforce IMDSv2 as a security best practice
+      requireImdsv2: true,
+    });
+
+    // Ensure the instance uses the explicitly named profile, not the CDK-auto-generated one
+    (bastion.node.defaultChild as ec2.CfnInstance).iamInstanceProfile =
+      instanceProfile.instanceProfileName;
+
+
+    // ── 5. CloudWatch Log Group ───────────────────────────────────────────
+    // Name follows AWS convention for EC2 logs: /aws/ec2/{env}-{project}-bastion
+    const logGroup = new logs.LogGroup(this, 'Ec2LogGroup', {
+      logGroupName:  `/aws/ec2/${envName}-${project}-bastion`,
+      retention:     logs.RetentionDays.ONE_MONTH,   // 30 days
+      removalPolicy: cdk.RemovalPolicy.RETAIN,       // Preserve logs on stack deletion
+    });
+
+
+    // ── Stack Outputs ─────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, 'VpcId', {
+      value:       vpc.vpcId,
+      description: 'VPC ID',
+      exportName:  `${envName}-${project}-vpc-id`,
+    });
+
+    new cdk.CfnOutput(this, 'BastionPublicIp', {
+      value:       bastion.instancePublicIp,
+      description: 'Public IP address of the bastion instance',
+      exportName:  `${envName}-${project}-bastion-public-ip`,
+    });
+
+    new cdk.CfnOutput(this, 'BastionInstanceId', {
+      value:       bastion.instanceId,
+      description: 'Instance ID of the bastion host',
+      exportName:  `${envName}-${project}-bastion-instance-id`,
+    });
+
+    new cdk.CfnOutput(this, 'LogGroupName', {
+      value:       logGroup.logGroupName,
+      description: 'CloudWatch Log Group for EC2 bastion logs',
+      exportName:  `${envName}-${project}-ec2-log-group`,
+    });
+  }
+}
