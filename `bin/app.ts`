@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { InfraStack } from '../lib/infra-stack';
+
+const app = new cdk.App();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️  REQUIRED: Replace ALL placeholder values below before running
+//    `npx cdk deploy`.  Deployment will fail validation if left as-is.
+//
+//    environment  → one of: dev | staging | prod
+//    project      → short project name, e.g. "myapp"
+//    team         → owning team name,   e.g. "platform"
+//    costCenter   → cost center code,   e.g. "CC-1234"  (must match CC-XXXX)
+// ─────────────────────────────────────────────────────────────────────────────
+new InfraStack(app, 'InfraStack', {
+
+  // ── REQUIRED inputs ────────────────────────────────────────────────────────
+  environment: '<REPLACE: dev | staging | prod>',  // ← REPLACE
+  project:     '<REPLACE: project-short-name>',    // ← REPLACE
+  team:        '<REPLACE: team-name>',             // ← REPLACE
+  costCenter:  '<REPLACE: CC-XXXX>',               // ← REPLACE
+
+  // ── Optional: override org defaults ───────────────────────────────────────
+  // cidrBlock: '10.0.0.0/16',   // org default — change only if needed
+  // maxAzs:    3,                // org default — 3 AZs for HA
+  // enableNat: true,             // org default — private subnets need egress
+  // singleNat: false,            // org default — set true to save cost in dev
+
+  // ── CDK environment (account + region) ────────────────────────────────────
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region:  process.env.CDK_DEFAULT_REGION,
+  },
+});
