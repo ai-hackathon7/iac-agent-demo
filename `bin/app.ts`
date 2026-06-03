@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { BastionStack } from '../lib/bastion-stack';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REQUIRED: Substitute real values before deployment.
+//   env        → one of: dev | staging | prod
+//   project    → short project identifier, e.g. "myapp"
+//   team       → owning team name, e.g. "platform"
+//   costCenter → must match pattern CC-XXXX, e.g. "CC-1234"
+//   awsEnv     → target AWS account + region for the stack
+// ─────────────────────────────────────────────────────────────────────────────
+const env        = process.env.ENV         ?? 'dev';
+const project    = process.env.PROJECT     ?? 'myproject';
+const team       = process.env.TEAM        ?? 'REPLACE-ME';
+const costCenter = process.env.COST_CENTER ?? 'CC-0000'; // Must match CC-[0-9]{4}
+
+const awsEnv: cdk.Environment = {
+  account: process.env.CDK_DEFAULT_ACCOUNT,
+  region:  process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+};
+
+const app = new cdk.App();
+
+new BastionStack(app, `${env}-${project}-bastion-stack`, {
+  env: awsEnv,
+  stackName: `${env}-${project}-bastion-stack`,
+  description: `Bastion host stack for ${project} (${env})`,
+  envName:    env,
+  project:    project,
+  team:       team,
+  costCenter: costCenter,
+});

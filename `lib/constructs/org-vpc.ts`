@@ -1,0 +1,63 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import { Construct } from 'constructs';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Org VPC Module v2.1.0
+// Wraps the standard org VPC pattern: public + private subnets, optional NAT.
+// Naming convention: {env}-{project}-vpc
+// Subnet convention: {env}-{project}-{tier}-{az}
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface OrgVpcProps {
+  /** VPC CIDR block. Default: 10.0.0.0/16 */
+  readonly cidrBlock?:   string;
+  /** Maximum number of AZs to use. Default: 3 */
+  readonly maxAzs?:      number;
+  /** Enable NAT gateways. Default: true */
+  readonly enableNat?:   boolean;
+  /** Use a single shared NAT gateway (cost saving). Default: false */
+  readonly singleNat?:   boolean;
+  readonly environment:  string;
+  readonly project:      string;
+}
+
+export class OrgVpc extends Construct {
+  public readonly vpc:            ec2.Vpc;
+  public readonly publicSubnets:  ec2.ISubnet[];
+  public readonly privateSubnets: ec2.ISubnet[];
+
+  constructor(scope: Construct, id: string, props: OrgVpcProps) {
+    super(scope, id);
+
+    const cidrBlock  = props.cidrBlock ?? '10.0.0.0/16';
+    const maxAzs     = props.maxAzs    ?? 3;
+    const enableNat  = props.enableNat ?? true;
+    const singleNat  = props.singleNat ?? false;
+    const natGatways = !enableNat ? 0 : singleNat ? 1 : maxAzs;
+
+    this.vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName:     `${props.environment}-${props.project}-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr(cidrBlock),
+      maxAzs,
+      natGateways: natGatways,
+      enableDnsHostnames: true,
+      enableDnsSupport:   true,
+      subnetConfiguration: [
+        {
+          cidrMask:   20,
+          name:       `${props.environment}-${props.project}-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+        },
+        {
+          cidrMask:   20,
+          name:       `${props.environment}-${props.project}-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        },
+      ],
+    });
+
+    this.publicSubnets  = this.vpc.publicSubnets;
+    this.privateSubnets = this.vpc.privateSubnets;
+  }
+}
