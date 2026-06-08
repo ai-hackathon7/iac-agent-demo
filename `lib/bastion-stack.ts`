@@ -1,0 +1,225 @@
+import * as cdk from 'aws-cdk-lib';
+import * as ec2  from 'aws-cdk-lib/aws-ec2';
+import * as iam  from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import { Construct } from 'constructs';
+
+// ---------------------------------------------------------------------------
+// Stack props
+// ---------------------------------------------------------------------------
+export interface BastionStackProps extends cdk.StackProps {
+  /** Environment name: dev | staging | prod */
+  appEnv: string;
+  /** Short project identifier */
+  project: string;
+  /** Owning team */
+  team: string;
+  /** Cost centre code — must match CC-[0-9]{4} */
+  costCenter: string;
+}
+
+// ---------------------------------------------------------------------------
+// Stack
+// ---------------------------------------------------------------------------
+export class BastionStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props: BastionStackProps) {
+    super(scope, id, props);
+
+    const { appEnv, project, team, costCenter } = props;
+
+    // -----------------------------------------------------------------------
+    // Org-required tags applied to EVERY resource in the stack
+    // (propagated automatically by CDK to all child constructs)
+    // -----------------------------------------------------------------------
+    cdk.Tags.of(this).add('Environment', appEnv);
+    cdk.Tags.of(this).add('Project',     project);
+    cdk.Tags.of(this).add('Team',        team);
+    cdk.Tags.of(this).add('CostCenter',  costCenter);
+    cdk.Tags.of(this).add('ManagedBy',   'cdk');   // plan said "terraform" — corrected to "cdk"
+
+    // -----------------------------------------------------------------------
+    // 1. VPC  — naming: {env}-{project}-vpc
+    //    org vpc module v2.1.0 pattern implemented as CDK L2
+    // -----------------------------------------------------------------------
+    const vpc = new ec2.Vpc(this, 'Vpc', {
+      vpcName:     `${appEnv}-${project}-vpc`,
+      ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
+      maxAzs:      3,
+      natGateways: 1, // singleNat=true → one shared NAT for cost efficiency
+      enableDnsHostnames: true,
+      enableDnsSupport:   true,
+      subnetConfiguration: [
+        {
+          // Naming: {env}-{project}-public-{az}  (CDK appends AZ suffix)
+          name:       `${appEnv}-${project}-public`,
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask:   20,   // /20 per AZ — 4094 usable IPs; 3 AZs = 3×/20 of 10.0.0.0/16
+        },
+        {
+          // Naming: {env}-{project}-private-{az}
+          name:       `${appEnv}-${project}-private`,
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask:   20,
+        },
+      ],
+    });
+
+    // VPC Flow Logs — ALWAYS enabled (org security baseline)
+    vpc.addFlowLog(`${appEnv}-${project}-vpc-flowlog`, {
+      destination: ec2.FlowLogDestination.toCloudWatchLogs(
+        new logs.LogGroup(this, 'VpcFlowLogGroup', {
+          logGroupName:  `/vpc/flowlogs/${appEnv}-${project}`,
+          retention:     logs.RetentionDays.THREE_MONTHS,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+        }),
+      ),
+      trafficType: ec2.FlowLogTrafficType.ALL,
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. CloudWatch Log Group for bastion SSM/SSH sessions
+    //    naming: /bastion/{env}-{project}
+    // -----------------------------------------------------------------------
+    const bastionLogGroup = new logs.LogGroup(this, 'BastionLogGroup', {
+      logGroupName:  `/bastion/${appEnv}-${project}`,
+      retention:     logs.RetentionDays.THREE_MONTHS, // 90 days as specified
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // -----------------------------------------------------------------------
+    // 3. IAM Role for bastion  — naming: {env}-{project}-bastion-role
+    //    Includes AmazonSSMManagedInstanceCore for Session Manager (keyless SSH)
+    // -----------------------------------------------------------------------
+    const bastionRole = new iam.Role(this, 'BastionRole', {
+      roleName:    `${appEnv}-${project}-bastion-role`,
+      description: 'IAM role for bastion host with SSM Session Manager access',
+      assumedBy:   new iam.ServicePrincipal('ec2.amazonaws.com'),
+      managedPolicies: [
+        // SSM Session Manager — keyless, auditable alternative to direct SSH
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
+      ],
+    });
+
+    // Least-privilege: allow writing SSM session logs to the bastion log group
+    bastionRole.addToPolicy(new iam.PolicyStatement({
+      sid:    'AllowSSMSessionLogging',
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'logs:CreateLogStream',
+        'logs:PutLogEvents',
+        'logs:DescribeLogGroups',
+        'logs:DescribeLogStreams',
+      ],
+      resources: [
+        bastionLogGroup.logGroupArn,
+        `${bastionLogGroup.logGroupArn}:log-stream:*`,
+      ],
+    }));
+
+    // -----------------------------------------------------------------------
+    // 4. Security Group for bastion  — naming: {env}-{project}-bastion-sg
+    //
+    //    ⚠ SSH ingress is currently 0.0.0.0/0 (as specified).
+    //      RESTRICT to known office/VPN CIDR before production use.
+    // -----------------------------------------------------------------------
+    const bastionSg = new ec2.SecurityGroup(this, 'BastionSg', {
+      securityGroupName: `${appEnv}-${project}-bastion-sg`,
+      description:       'Security group for bastion host SSH access',
+      vpc,
+      allowAllOutbound:  false, // explicit egress rules below
+    });
+
+    // Ingress: SSH (port 22) — ⚠ restricted to 0.0.0.0/0 per plan; tighten this!
+    bastionSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(22),
+      'SSH from allowed CIDRs — REPLACE with specific CIDR before prod',
+    );
+
+    // Egress: HTTPS to SSM endpoints (443) — required for Session Manager
+    bastionSg.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      'Allow HTTPS outbound for SSM Session Manager endpoints',
+    );
+
+    // Egress: HTTP (for yum/dnf package updates on Amazon Linux 2023)
+    bastionSg.addEgressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      'Allow HTTP outbound for OS package updates',
+    );
+
+    // -----------------------------------------------------------------------
+    // 5. Bastion EC2 Instance  — naming: {env}-{project}-bastion
+    //    Latest Amazon Linux 2023 AMI (SSM-managed parameter lookup)
+    //    Placed in a PUBLIC subnet with public IP (SSH ingress model)
+    // -----------------------------------------------------------------------
+
+    // Resolve the latest Amazon Linux 2023 AMI via SSM parameter (no AMI ID hardcoding)
+    const al2023Ami = ec2.MachineImage.latestAmazonLinux2023({
+      cpuType: ec2.AmazonLinuxCpuType.X86_64,
+    });
+
+    const bastionInstance = new ec2.Instance(this, 'BastionInstance', {
+      instanceName:           `${appEnv}-${project}-bastion`,
+      vpc,
+      vpcSubnets:             { subnetType: ec2.SubnetType.PUBLIC },
+      instanceType:           ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      machineImage:           al2023Ami,
+      securityGroup:          bastionSg,
+      role:                   bastionRole,
+      associatePublicIpAddress: true,
+
+      // Root volume: gp3, 20 GB, encrypted (org security baseline)
+      blockDevices: [
+        {
+          deviceName: '/dev/xvda',
+          volume: ec2.BlockDeviceVolume.ebs(20, {
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
+            encrypted:  true,
+            deleteOnTermination: true,
+          }),
+        },
+      ],
+
+      // Detailed monitoring for production visibility
+      detailedMonitoring: true,
+
+      // IMDSv2 enforced (security hardening — org baseline)
+      requireImdsv2: true,
+    });
+
+    // -----------------------------------------------------------------------
+    // CloudFormation Outputs
+    // -----------------------------------------------------------------------
+    new cdk.CfnOutput(this, 'VpcId', {
+      value:       vpc.vpcId,
+      description: 'VPC ID',
+      exportName:  `${appEnv}-${project}-vpc-id`,
+    });
+
+    new cdk.CfnOutput(this, 'BastionInstanceId', {
+      value:       bastionInstance.instanceId,
+      description: 'Bastion host EC2 instance ID',
+      exportName:  `${appEnv}-${project}-bastion-instance-id`,
+    });
+
+    new cdk.CfnOutput(this, 'BastionPublicIp', {
+      value:       bastionInstance.instancePublicIp,
+      description: 'Bastion host public IP address',
+      exportName:  `${appEnv}-${project}-bastion-public-ip`,
+    });
+
+    new cdk.CfnOutput(this, 'BastionLogGroupName', {
+      value:       bastionLogGroup.logGroupName,
+      description: 'CloudWatch Log Group for bastion SSM/SSH session logs',
+      exportName:  `${appEnv}-${project}-bastion-log-group`,
+    });
+
+    new cdk.CfnOutput(this, 'SSMConnectCommand', {
+      value:       `aws ssm start-session --target ${bastionInstance.instanceId}`,
+      description: 'AWS CLI command to connect via SSM Session Manager (no SSH key needed)',
+    });
+  }
+}

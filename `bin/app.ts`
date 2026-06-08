@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+import 'source-map-support/register';
+import * as cdk from 'aws-cdk-lib';
+import { BastionStack } from '../lib/bastion-stack';
+
+const app = new cdk.App();
+
+// ---------------------------------------------------------------------------
+// Configuration — replace all placeholder values before deploying
+// ---------------------------------------------------------------------------
+const env     = app.node.tryGetContext('env')        ?? 'dev';       // e.g. npx cdk synth -c env=prod
+const project = app.node.tryGetContext('project')    ?? 'myproject'; // e.g. -c project=myproject
+const team    = app.node.tryGetContext('team')        ?? 'platform';  // e.g. -c team=platform
+const costCenter = app.node.tryGetContext('costCenter') ?? 'CC-0000'; // must match CC-XXXX
+
+new BastionStack(app, `${env}-${project}-bastion-stack`, {
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region:  process.env.CDK_DEFAULT_REGION,
+  },
+  stackName: `${env}-${project}-bastion-stack`,
+  description: `Bastion host stack for ${project} (${env})`,
+  // Stack-level props passed through
+  appEnv:     env,
+  project:    project,
+  team:       team,
+  costCenter: costCenter,
+});
